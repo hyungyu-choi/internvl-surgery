@@ -1,6 +1,3 @@
-"""
-Training script for finetuning InternVL3 on surgical phase recognition
-"""
 import os
 import torch
 import torch.nn as nn
@@ -8,231 +5,165 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from configs import get_train_args, get_dataset_config
-from models import InternVL3Wrapper
-from data import get_dataset
+from models.internvl_wrapper import InternVL3Wrapper
+from models.ranking_head import RankingHead
+from losses.plackett_luce import PlackettLuceLoss
+from data.cholec_ranking_dataset import CholecRankingDataset
 
 
-class SurgicalPhaseClassifier(nn.Module):
-    """
-    Surgical phase classifier wrapper around InternVL3
-    """
-    
-    def __init__(self, model_wrapper, num_phases, hidden_dim=4096):
-        """
-        Args:
-            model_wrapper: InternVL3Wrapper instance
-            num_phases: Number of surgical phases
-            hidden_dim: Hidden dimension of embeddings
-        """
+class TemporalRankingModel(nn.Module):
+    def __init__(self, internvl_wrapper, hidden_dim=3584):
         super().__init__()
-        self.model = model_wrapper.model
-        self.tokenizer = model_wrapper.tokenizer
-        self.layer_idx = model_wrapper.layer_idx
-        
-        # Classification head
-        self.classifier = nn.Linear(hidden_dim, num_phases)
-        
-    def forward(self, pixel_values, num_patches_list):
-        """
-        Forward pass for classification
-        
-        Args:
-            pixel_values: Preprocessed images [B, num_patches, 3, H, W]
-            num_patches_list: List of number of patches per image
-        
-        Returns:
-            Logits [B, num_phases]
-        """
-        # TODO: Implement forward pass
-        # Extract visual embeddings from InternVL3
-        # Pass through classification head
-        raise NotImplementedError("Forward pass to be implemented")
+        self.internvl = internvl_wrapper
+        self.ranking_head = RankingHead(hidden_dim=hidden_dim)
     
-    def extract_embeddings(self, pixel_values, num_patches_list):
-        """Extract visual embeddings without classification"""
-        # TODO: Implement embedding extraction
-        raise NotImplementedError("Embedding extraction to be implemented")
+    def extract_last_token(self, pixel_values, num_patches_list):
+        last_tokens = []
+        
+        def hook_fn(module, input, output):
+            hidden_states = output[0] if isinstance(output, tuple) else output
+            last_token = hidden_states[:, -1, :]
+            last_tokens.append(last_token)
+        
+        last_layer_idx = len(self.internvl.model.language_model.model.layers) - 1
+        hook = self.internvl.model.language_model.model.layers[last_layer_idx].register_forward_hook(hook_fn)
+        
+        try:
+                # Remove batch dimension: [1, num_patches, 3, H, W] -> [num_patches, 3, H, W]
+                pixel_values = pixel_values.squeeze(0).to(self.internvl.device)
+                
+                _ = self.internvl.model.chat(
+                    self.internvl.tokenizer,
+                    pixel_values,
+                    "Describe this image.",
+                    generation_config=dict(max_new_tokens=1, do_sample=False),
+                    num_patches_list=num_patches_list,
+                    history=None,
+                    return_history=False
+                )
+        finally:
+            hook.remove()
+        
+        return last_tokens[0] if last_tokens else None
+    
+    def forward(self, pixel_values_list, num_patches_lists):
+        embeddings = []
+        for pixel_values, num_patches_list in zip(pixel_values_list, num_patches_lists):
+            last_token = self.extract_last_token(pixel_values, num_patches_list)
+            embeddings.append(last_token.squeeze(0).float())  # bfloat16 -> float32
+        
+        embeddings = torch.stack(embeddings, dim=0).unsqueeze(0)
+        scores = self.ranking_head(embeddings)
+        return scores.squeeze(0)
 
 
 def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
-    """
-    Train for one epoch
+    model.ranking_head.train()
     
-    Args:
-        model: SurgicalPhaseClassifier
-        dataloader: Training dataloader
-        optimizer: Optimizer
-        criterion: Loss function
-        device: Device to train on
-        epoch: Current epoch number
-    
-    Returns:
-        Average loss for the epoch
-    """
-    model.train()
     total_loss = 0
-    correct = 0
-    total = 0
-    
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
     
-    for batch_idx, batch in enumerate(pbar):
-        # Get data
-        pixel_values = batch['pixel_values'].to(device)
-        labels = batch['label'].to(device)
-        num_patches_list = batch['num_patches_list']
-        
-        # Forward pass
-        # TODO: Implement training loop
-        # logits = model(pixel_values, num_patches_list)
-        # loss = criterion(logits, labels)
-        
-        # Backward pass
-        # optimizer.zero_grad()
-        # loss.backward()
-        # optimizer.step()
-        
-        # Update metrics
-        # total_loss += loss.item()
-        
-        # Update progress bar
-        pbar.set_postfix({
-            'loss': 0.0,  # loss.item()
-            'acc': 0.0    # correct / total
-        })
+    # 첫 번째 파라미터 추적
+    first_param = next(model.ranking_head.parameters())
+    param_before = first_param.clone().detach()
     
-    # TODO: Return actual metrics
+    for i, batch in enumerate(pbar):
+        pixel_values_list = batch['pixel_values_list']
+        num_patches_lists = batch['num_patches_lists']
+        gt_order = batch['ground_truth_order'].to(device)
+        
+        optimizer.zero_grad()
+        
+        scores = model(pixel_values_list, num_patches_lists)
+        scores = scores.unsqueeze(0)
+        
+        loss = criterion(scores, gt_order)
+        
+        loss.backward()
+        
+        # Gradient 확인
+        if i < 2000:
+            print(f"\nScores: {scores}")
+            print(f"GT Order: {gt_order}")
+            print(f"Loss: {loss.item()}")
+            has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 
+                          for p in model.ranking_head.parameters())
+            print(f"Has gradient: {has_grad}")
+            if has_grad:
+                grad_norm = sum(p.grad.norm().item() for p in model.ranking_head.parameters() if p.grad is not None)
+                print(f"Gradient norm: {grad_norm}")
+        
+        optimizer.step()
+        
+        # 파라미터 변화 확인
+        if i == 0:
+            param_after = first_param.clone().detach()
+            param_diff = (param_after - param_before).abs().sum()
+            print(f"Parameter change: {param_diff.item()}\n")
+        
+        total_loss += loss.item()
+        pbar.set_postfix({'loss': loss.item()})
+    
     return total_loss / len(dataloader)
 
 
-def validate(model, dataloader, criterion, device):
-    """
-    Validate the model
-    
-    Args:
-        model: SurgicalPhaseClassifier
-        dataloader: Validation dataloader
-        criterion: Loss function
-        device: Device
-    
-    Returns:
-        Dictionary with validation metrics
-    """
-    model.eval()
-    total_loss = 0
-    correct = 0
-    total = 0
-    
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc='Validation'):
-            # Get data
-            pixel_values = batch['pixel_values'].to(device)
-            labels = batch['label'].to(device)
-            num_patches_list = batch['num_patches_list']
-            
-            # Forward pass
-            # TODO: Implement validation
-            # logits = model(pixel_values, num_patches_list)
-            # loss = criterion(logits, labels)
-            
-            # Update metrics
-            # total_loss += loss.item()
-            pass
-    
-    # TODO: Return actual metrics
-    metrics = {
-        'val_loss': 0.0,
-        'val_acc': 0.0
-    }
-    
-    return metrics
-
-
 def main():
-    """Main training function"""
     args = get_train_args()
     
-    # Set GPU
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda')
     
     print(f"\n{'='*60}")
-    print(f"InternVL3 Surgical Phase Recognition - Training")
+    print(f"InternVL3 Temporal Ranking Training")
     print(f"{'='*60}")
-    print(f"Dataset: {args.dataset}")
-    print(f"Model: {args.model_path}")
-    print(f"Batch size: {args.batch_size}")
     print(f"Epochs: {args.epochs}")
     print(f"Learning rate: {args.lr}")
-    print(f"Device: {device}")
     print(f"{'='*60}\n")
     
-    # Get dataset config
     config = get_dataset_config(args.dataset)
-    num_phases = config['num_phases']
     
-    # TODO: Load datasets
-    print("Loading datasets...")
-    # train_dataset = get_dataset(args.dataset, ...)
-    # val_dataset = get_dataset(args.dataset, ...)
+    train_dataset = CholecRankingDataset(
+        base_frames_dir=config['base_frames_dir'].replace('test_set', 'training_set'),
+        num_frames=5,
+        samples_per_video=10
+    )
     
-    # train_loader = DataLoader(
-    #     train_dataset,
-    #     batch_size=args.batch_size,
-    #     shuffle=True,
-    #     num_workers=args.num_workers
-    # )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=1,
+        shuffle=True,
+        num_workers=0
+    )
     
-    # val_loader = DataLoader(
-    #     val_dataset,
-    #     batch_size=args.batch_size,
-    #     shuffle=False,
-    #     num_workers=args.num_workers
-    # )
+    internvl_wrapper = InternVL3Wrapper(args.model_path, device=device)
+    model = TemporalRankingModel(internvl_wrapper).to(device)
     
-    # Initialize model
-    print("Initializing model...")
-    model_wrapper = InternVL3Wrapper(args.model_path, device=device)
-    model = SurgicalPhaseClassifier(model_wrapper, num_phases)
-    model = model.to(device)
+    for param in model.internvl.model.parameters():
+        param.requires_grad = False
     
-    # Freeze components if specified
-    if args.freeze_vision:
-        print("Freezing vision encoder...")
-        for param in model.model.vision_model.parameters():
-            param.requires_grad = False
-    
-    if args.freeze_llm:
-        print("Freezing language model...")
-        for param in model.model.language_model.parameters():
-            param.requires_grad = False
-    
-    # Setup optimizer and loss
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        model.ranking_head.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay
     )
     
-    criterion = nn.CrossEntropyLoss()
+    criterion = PlackettLuceLoss()
     
-    # TODO: Implement training loop
-    print("\nStarting training...")
-    print("NOTE: Training loop to be implemented")
-    print("This is a skeleton for future finetuning work\n")
+    for epoch in range(1, args.epochs + 1):
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, device, epoch)
+        print(f"Epoch {epoch}: Loss = {train_loss:.4f}")
+        
+        if epoch % args.save_freq == 0:
+            os.makedirs(args.output_dir, exist_ok=True)
+            torch.save({
+                'epoch': epoch,
+                'ranking_head_state_dict': model.ranking_head.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': train_loss,
+            }, f"{args.output_dir}/checkpoint_epoch_{epoch}.pth")
+            print(f"Saved checkpoint")
     
-    # for epoch in range(1, args.epochs + 1):
-    #     train_loss = train_epoch(model, train_loader, optimizer, criterion, device, epoch)
-    #     
-    #     if epoch % args.eval_freq == 0:
-    #         val_metrics = validate(model, val_loader, criterion, device)
-    #         print(f"Epoch {epoch}: Train Loss: {train_loss:.4f}, Val Loss: {val_metrics['val_loss']:.4f}")
-    #     
-    #     if epoch % args.save_freq == 0:
-    #         # Save checkpoint
-    #         pass
-    
-    print("Training complete!")
+    print("\nTraining complete!")
 
 
 if __name__ == "__main__":

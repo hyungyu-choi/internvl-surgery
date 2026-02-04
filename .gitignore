@@ -44,7 +44,6 @@ outputs/
 
 # Datasets
 Dataset/
-data/
 datasets/
 
 # Logs

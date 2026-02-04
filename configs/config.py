@@ -16,13 +16,13 @@ MAX_NUM_PATCHES = 12
 DATASET_CONFIGS = {
     'cholec': {
         'embeddings_path': "./experiments/embeddings/cholec_internvl3_phase_embeddings_13_layer_5_shot/phase_embeddings_stats.pkl",
-        'base_frames_dir': "../../../Dataset/cholec80/frames/extract_1fps/test_set",
+        'base_frames_dir': "../../code/Dataset/cholec80/frames/extract_1fps/test_set",
         'output_root': "./experiments/predictions/cholec_internvl3_embedding_13_layer_5_shot_pred_window5_avg_all_testset",
         'num_phases': 7,
     },
     'autolaparo': {
         'embeddings_path': "./experiments/embeddings/autolaparo_internvl3_phase_embeddings_13_layer_5_shot/phase_embeddings_stats.pkl",
-        'base_frames_dir': "../../../Dataset/AutoLaparo_Task1/frames/test_set",
+        'base_frames_dir': "../../code/Dataset/AutoLaparo_Task1/frames/test_set",
         'output_root': "./experiments/predictions/autolaparo_internvl3_embedding_13_layer_5_shot_pred_window5_avg_all_testset",
         'num_phases': 8,
     }
@@ -105,7 +105,7 @@ def get_train_args():
                         help='Input image size')
     parser.add_argument('--max_patches', type=int, default=MAX_NUM_PATCHES,
                         help='Maximum number of patches')
-    
+
     # Hardware
     parser.add_argument('--gpu', type=int, default=0,
                         help='GPU device ID')
