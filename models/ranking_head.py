@@ -12,11 +12,11 @@ class RankingHead(nn.Module):
             nn.Linear(mlp_dim, mlp_dim)
         )
         
-        self.self_attn = nn.MultiheadAttention(
-            embed_dim=mlp_dim,
-            num_heads=num_heads,
-            batch_first=True
-        )
+        # self.self_attn = nn.MultiheadAttention(
+        #     embed_dim=mlp_dim,
+        #     num_heads=num_heads,
+        #     batch_first=True
+        # )
         
         self.mlp2 = nn.Sequential(
             nn.Linear(mlp_dim, mlp_dim // 2),
@@ -32,7 +32,6 @@ class RankingHead(nn.Module):
             scores: [batch_size, K]
         """
         x = self.mlp1(embeddings)
-        print(x.shape)
-        x, _ = self.self_attn(x, x, x)
+        # x, _ = self.self_attn(x, x, x)
         scores = self.mlp2(x).squeeze(-1)
         return scores

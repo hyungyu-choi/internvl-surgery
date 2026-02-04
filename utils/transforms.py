@@ -68,7 +68,7 @@ def preprocess_image(image_path, input_size=448, max_num_patches=12):
     
     # Dynamic preprocessing
     tiles = dynamic_preprocess(img, image_size=input_size, 
-                              use_thumbnail=True, max_num=max_num_patches)
+                              use_thumbnail=False, max_num=max_num_patches)
     
     # Apply transforms
     transform = build_transform(input_size)

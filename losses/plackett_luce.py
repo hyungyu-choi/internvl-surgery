@@ -18,7 +18,9 @@ class PlackettLuceLoss(nn.Module):
         loss = 0.0
         
         for b in range(batch_size):
+            print(scores)
             s = scores[b]
+            print(s)
             r_star = ground_truth_order[b]
             
             log_prob = 0.0

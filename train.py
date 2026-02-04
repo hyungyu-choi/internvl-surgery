@@ -81,25 +81,25 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
         
         loss.backward()
         
-        # Gradient 확인
-        if i < 2000:
-            print(f"\nScores: {scores}")
-            print(f"GT Order: {gt_order}")
-            print(f"Loss: {loss.item()}")
-            has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 
-                          for p in model.ranking_head.parameters())
-            print(f"Has gradient: {has_grad}")
-            if has_grad:
-                grad_norm = sum(p.grad.norm().item() for p in model.ranking_head.parameters() if p.grad is not None)
-                print(f"Gradient norm: {grad_norm}")
+        # # Gradient 확인
+        # if i < 2000:
+        #     print(f"\nScores: {scores}")
+        #     print(f"GT Order: {gt_order}")
+        #     print(f"Loss: {loss.item()}")
+        #     has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 
+        #                   for p in model.ranking_head.parameters())
+        #     print(f"Has gradient: {has_grad}")
+        #     if has_grad:
+        #         grad_norm = sum(p.grad.norm().item() for p in model.ranking_head.parameters() if p.grad is not None)
+        #         print(f"Gradient norm: {grad_norm}")
         
-        optimizer.step()
+        # optimizer.step()
         
-        # 파라미터 변화 확인
-        if i == 0:
-            param_after = first_param.clone().detach()
-            param_diff = (param_after - param_before).abs().sum()
-            print(f"Parameter change: {param_diff.item()}\n")
+        # # 파라미터 변화 확인
+        # if i < 2000:
+        #     param_after = first_param.clone().detach()
+        #     param_diff = (param_after - param_before).abs().sum()
+        #     print(f"Parameter change: {param_diff.item()}\n")
         
         total_loss += loss.item()
         pbar.set_postfix({'loss': loss.item()})
@@ -124,7 +124,7 @@ def main():
     
     train_dataset = CholecRankingDataset(
         base_frames_dir=config['base_frames_dir'].replace('test_set', 'training_set'),
-        num_frames=5,
+        num_frames=3,
         samples_per_video=10
     )
     
