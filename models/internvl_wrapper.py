@@ -3,7 +3,7 @@ InternVL3 Model Wrapper using HuggingFace official implementation
 """
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoModel, AutoTokenizer, AutoImageProcessor
 
 
 class InternVL3Wrapper(nn.Module):
@@ -11,23 +11,33 @@ class InternVL3Wrapper(nn.Module):
     Wrapper for InternVL3 using HuggingFace official API
     """
     
-    def __init__(self, model_path, device='cuda'):
+    def __init__(self, model_path, device='cuda', dtype=torch.bfloat16):
         super().__init__()
         self.model_path = model_path
         self.device = device
+        self.dtype = dtype
         
         print(f"Loading InternVL3 from {model_path}...")
-        self.processor = AutoProcessor.from_pretrained(
+        print(f"Using dtype: {dtype}")
+        
+        # Load components separately
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True
+        )
+        self.image_processor = AutoImageProcessor.from_pretrained(
             model_path, trust_remote_code=True
         )
         self.model = AutoModel.from_pretrained(
             model_path,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=dtype,
             trust_remote_code=True
         ).to(device)
         
         self.hidden_dim = self.model.language_model.config.hidden_size
-        print(f"Model loaded. Hidden dim: {self.hidden_dim}")
+        
+        # Get image sequence length from config
+        self.image_seq_length = getattr(self.model.config, 'image_seq_length', 256)
+        print(f"✓ Model loaded. Hidden dim: {self.hidden_dim}, image_seq_length: {self.image_seq_length}")
     
     def freeze_vision_encoder(self):
         """Freeze vision encoder parameters"""
@@ -35,83 +45,58 @@ class InternVL3Wrapper(nn.Module):
             param.requires_grad = False
         print("✓ Vision encoder frozen")
     
-    def forward(self, pixel_values, input_ids, attention_mask):
+    def forward(self, **kwargs):
         """
         Forward pass through InternVL model
         
         Args:
-            pixel_values: [B, C, H, W] image tensor
-            input_ids: [B, seq_len] token ids
-            attention_mask: [B, seq_len] attention mask
+            **kwargs: All model inputs
         
         Returns:
             last_hidden_state: [B, seq_len, hidden_dim]
         """
         outputs = self.model(
-            pixel_values=pixel_values,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
             output_hidden_states=True,
-            return_dict=True
+            return_dict=True,
+            **kwargs
         )
-        return outputs.last_hidden_state
+        
+        # CausalLMOutputWithPast has hidden_states tuple
+        # hidden_states[-1] is the last layer
+        return outputs.hidden_states[-1]
     
-    def process_image_for_forward(self, pixel_values, num_patches_list):
+    def process_single_image(self, image):
         """
-        Process image using InternVL processor
+        Process single PIL image with exact 256 image pad tokens
         
         Args:
-            pixel_values: Preprocessed image tensor
-            num_patches_list: List of num patches
+            image: PIL Image
         
         Returns:
             Processed inputs dict
         """
-        # Convert tensor to PIL Image for processor
-        from PIL import Image
-        import torchvision.transforms as T
+        # Process single image
+        image_inputs = self.image_processor(images=image, return_tensors="pt")
         
-        if pixel_values.dim() == 5:
-            pixel_values = pixel_values.squeeze(0)
+        # Use ONLY image_pad tokens (exactly 256)
+        image_pad = "<|image_pad|>"
+        text = image_pad * self.image_seq_length  # Exactly 256 tokens
         
-        # Convert from tensor to PIL
-        to_pil = T.ToPILImage()
-        images = [to_pil(pixel_values[i]) for i in range(pixel_values.size(0))]
+        # Tokenize text
+        text_inputs = self.tokenizer(text, return_tensors="pt", padding=True)
         
-        # Use processor
-        text = "Image"
-        inputs = self.processor(
-            images=images[0] if len(images) == 1 else images,
-            text=text,
-            return_tensors='pt',
-            padding=True
-        )
+        # Create image_flags for single image
+        image_flags = torch.tensor([[1]], dtype=torch.long)
         
-        return {k: v.to(self.device) for k, v in inputs.items()}
-    
-    def extract_last_token_embedding(self, pixel_values, num_patches_list):
-        """
-        Extract last token embedding from LLM
+        # Combine
+        inputs = {
+            'pixel_values': image_inputs['pixel_values'].to(self.device).to(self.dtype),
+            'input_ids': text_inputs['input_ids'].to(self.device),
+            'attention_mask': text_inputs['attention_mask'].to(self.device),
+            'image_flags': image_flags.to(self.device)
+        }
         
-        Args:
-            pixel_values: Preprocessed image tensor
-            num_patches_list: List of num patches
-        
-        Returns:
-            Last token embedding [hidden_dim]
-        """
-        inputs = self.process_image_for_forward(pixel_values, num_patches_list)
-        
-        with torch.no_grad():
-            outputs = self.model(
-                **inputs,
-                output_hidden_states=True,
-                return_dict=True
-            )
-            # Extract last token: [1, seq_len, hidden_dim] -> [hidden_dim]
-            last_token = outputs.last_hidden_state[0, -1, :]
-        
-        return last_token.cpu().numpy()
+        return inputs
     
     def get_trainable_parameters(self):
         """Return trainable parameters info"""

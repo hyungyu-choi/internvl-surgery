@@ -3,8 +3,9 @@ import torch.nn as nn
 
 
 class RankingHead(nn.Module):
-    def __init__(self, hidden_dim, mlp_dim=1024, num_heads=8):
+    def __init__(self, hidden_dim, mlp_dim=1024, num_heads=8, dtype=torch.bfloat16):
         super().__init__()
+        self.dtype = dtype
         
         self.mlp1 = nn.Sequential(
             nn.Linear(hidden_dim, mlp_dim),
@@ -12,15 +13,16 @@ class RankingHead(nn.Module):
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(mlp_dim, mlp_dim)
-        )
+        ).to(dtype)
         
         self.self_attn = nn.MultiheadAttention(
             embed_dim=mlp_dim,
             num_heads=num_heads,
             batch_first=True,
             dropout=0.1
-        )
-        self.attn_norm = nn.LayerNorm(mlp_dim)
+        ).to(dtype)
+        
+        self.attn_norm = nn.LayerNorm(mlp_dim).to(dtype)
         
         self.mlp2 = nn.Sequential(
             nn.Linear(mlp_dim, mlp_dim // 2),
@@ -28,7 +30,7 @@ class RankingHead(nn.Module):
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(mlp_dim // 2, 1)
-        )
+        ).to(dtype)
     
     def forward(self, embeddings):
         """

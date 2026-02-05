@@ -11,52 +11,92 @@ from models.ranking_head import RankingHead
 from losses.plackett_luce import PlackettLuceLoss
 from data.cholec_ranking_dataset import CholecRankingDataset
 
+def collate_fn(batch):
+    """Custom collate function for PIL images"""
+    images = [item['images'] for item in batch]
+    gt_orders = torch.stack([item['ground_truth_order'] for item in batch])
+    video_ids = [item['video_id'] for item in batch]
+    
+    return {
+        'images': images,  # List of lists of PIL images
+        'ground_truth_order': gt_orders,
+        'video_ids': video_ids
+    }
 
 class TemporalRankingModel(nn.Module):
-    def __init__(self, internvl_wrapper, hidden_dim):
+    def __init__(self, internvl_wrapper, hidden_dim, dtype=torch.bfloat16):
         super().__init__()
         self.internvl = internvl_wrapper
-        self.ranking_head = RankingHead(hidden_dim=hidden_dim)
+        self.ranking_head = RankingHead(hidden_dim=hidden_dim, dtype=dtype)
         self.hidden_dim = hidden_dim
+        self.dtype = dtype
     
-    def forward(self, pixel_values_list, num_patches_lists):
+    def forward(self, images_list):
         """
         Extract embeddings and compute ranking scores
         
         Args:
-            pixel_values_list: List of [num_patches, 3, H, W] tensors
-            num_patches_lists: List of num_patches
+            images_list: List of PIL Images [K images]
         
         Returns:
             scores: [K] ranking scores
         """
         embeddings = []
         
-        for pixel_values, num_patches_list in zip(pixel_values_list, num_patches_lists):
-            # Process image using InternVL processor
-            inputs = self.internvl.process_image_for_forward(
-                pixel_values, 
-                num_patches_list
-            )
+        for idx, img in enumerate(images_list):
+            # Process SINGLE image
+            inputs = self.internvl.process_single_image(img)
             
             # Forward through InternVL
-            hidden_states = self.internvl(
-                pixel_values=inputs['pixel_values'],
-                input_ids=inputs['input_ids'],
-                attention_mask=inputs['attention_mask']
-            )
+            with torch.no_grad():  # Save memory
+                hidden_states = self.internvl(**inputs)
             
             # Extract last token: [1, seq_len, hidden_dim] -> [hidden_dim]
-            last_token = hidden_states[0, -1, :]
+            last_token = hidden_states[0, -1, :].clone()
             embeddings.append(last_token)
         
-        # Stack: [K, hidden_dim]
+        # Stack and get scores
         embeddings = torch.stack(embeddings, dim=0).unsqueeze(0)  # [1, K, hidden_dim]
-        
-        # Get ranking scores
+        embeddings = embeddings.to(self.dtype)
         scores = self.ranking_head(embeddings)  # [1, K]
         
         return scores.squeeze(0)  # [K]
+
+def check_model_dtypes(model, verbose=True):
+    """Check and report dtypes across the model"""
+    if verbose:
+        print(f"\n{'='*80}")
+        print("DTYPE CHECK")
+        print(f"{'='*80}")
+    
+    # Check InternVL
+    internvl_dtypes = {}
+    for name, param in model.internvl.model.named_parameters():
+        dtype = param.dtype
+        if dtype not in internvl_dtypes:
+            internvl_dtypes[dtype] = 0
+        internvl_dtypes[dtype] += 1
+    
+    if verbose:
+        print(f"\nInternVL Model:")
+        for dtype, count in internvl_dtypes.items():
+            print(f"  {dtype}: {count} parameters")
+    
+    # Check RankingHead
+    ranking_dtypes = {}
+    for name, param in model.ranking_head.named_parameters():
+        dtype = param.dtype
+        if dtype not in ranking_dtypes:
+            ranking_dtypes[dtype] = 0
+        ranking_dtypes[dtype] += 1
+    
+    if verbose:
+        print(f"\nRanking Head:")
+        for dtype, count in ranking_dtypes.items():
+            print(f"  {dtype}: {count} parameters")
+        print(f"{'='*80}\n")
+    
+    return internvl_dtypes, ranking_dtypes
 
 
 def print_trainable_parameters(model):
@@ -110,6 +150,12 @@ def apply_lora_to_llm(model, lora_r=16, lora_alpha=32, lora_dropout=0.1):
     )
     
     model.language_model = get_peft_model(model.language_model, lora_config)
+    
+    # Convert LoRA parameters to bfloat16
+    for name, param in model.language_model.named_parameters():
+        if param.requires_grad and param.dtype != torch.bfloat16:
+            param.data = param.data.to(torch.bfloat16)
+    
     print("✓ LoRA applied to language model")
     
     return model
@@ -141,16 +187,18 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
     total_loss = 0
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
     
-    for batch in pbar:
-        pixel_values_list = batch['pixel_values_list']
-        num_patches_lists = batch['num_patches_lists']
-        gt_order = batch['ground_truth_order'].to(device)
+    for batch_idx, batch in enumerate(pbar):
+        # batch['images'] is list of list: [[img1, img2, img3], ...]
+        # Since batch_size=1, take first element
+        images_list = batch['images'][0]  # This is [img1, img2, img3]
+        gt_order = batch['ground_truth_order'][0:1]  # Keep batch dimension: [1, K]
+        gt_order = gt_order.to(device)
         
         optimizer.zero_grad()
         
         try:
-            # Forward pass
-            scores = model(pixel_values_list, num_patches_lists)
+            # Forward pass - images_list is a list of PIL images
+            scores = model(images_list)  # Returns [K]
             scores = scores.unsqueeze(0)  # [1, K]
             
             # Compute loss
@@ -165,17 +213,24 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
         
         except Exception as e:
-            print(f"\nError in batch: {e}")
-            continue
+            print(f"\n[ERROR] Batch {batch_idx}: {e}")
+            import traceback
+            traceback.print_exc()
+            if batch_idx == 0:
+                print(f"\nDebug info:")
+                print(f"  type(images_list): {type(images_list)}")
+                print(f"  len(images_list): {len(images_list)}")
+                print(f"  type(images_list[0]): {type(images_list[0])}")
+            raise e
     
     return total_loss / len(dataloader)
-
 
 def main():
     args = get_train_args()
     
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     device = torch.device('cuda')
+    dtype = torch.bfloat16
     
     print(f"\n{'='*80}")
     print("InternVL3 Temporal Ranking Training")
@@ -186,6 +241,7 @@ def main():
     print(f"Learning rate: {args.lr}")
     print(f"Batch size: {args.batch_size}")
     print(f"Freeze vision: {args.freeze_vision}")
+    print(f"Dtype: {dtype}")
     print(f"{'='*80}\n")
     
     config = get_dataset_config(args.dataset)
@@ -201,13 +257,18 @@ def main():
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0
+        num_workers=0,
+        collate_fn=collate_fn  # ✓ 추가
     )
     
     print(f"Training samples: {len(train_dataset)}")
     
-    # Initialize InternVL wrapper
-    internvl_wrapper = InternVL3Wrapper(args.model_path, device=device)
+    # Initialize InternVL wrapper with explicit dtype
+    internvl_wrapper = InternVL3Wrapper(
+        args.model_path, 
+        device=device,
+        dtype=dtype
+    )
     hidden_dim = internvl_wrapper.hidden_dim
     
     # Setup for training: freeze vision + LoRA
@@ -217,8 +278,17 @@ def main():
         use_lora=True
     )
     
-    # Create full model
-    model = TemporalRankingModel(internvl_wrapper, hidden_dim).to(device)
+    # Create full model with matching dtype
+    model = TemporalRankingModel(
+        internvl_wrapper, 
+        hidden_dim,
+        dtype=dtype
+    ).to(device)
+    
+    # Check dtype consistency
+    print("\n" + "="*80)
+    print("Initial dtype check:")
+    check_model_dtypes(model, verbose=True)
     
     # Print trainable parameters
     print_trainable_parameters(model)

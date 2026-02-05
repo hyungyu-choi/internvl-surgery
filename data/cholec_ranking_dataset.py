@@ -3,7 +3,8 @@ import random
 from pathlib import Path
 import torch
 from torch.utils.data import Dataset
-from utils import get_frame_list, preprocess_image
+from PIL import Image
+from utils import get_frame_list
 
 
 class CholecRankingDataset(Dataset):
@@ -35,22 +36,18 @@ class CholecRankingDataset(Dataset):
         sampled_indices = sorted(random.sample(range(len(frame_files)), self.num_frames))
         sampled_frames = [frame_files[i] for i in sampled_indices]
         
-        # Preprocess frames
-        pixel_values_list = []
-        num_patches_lists = []
-        
+        # Load PIL images (not preprocessed)
+        pil_images = []
         for frame_file in sampled_frames:
             frame_path = frames_dir / frame_file
-            pixel_values, num_patches_list = preprocess_image(str(frame_path))
-            pixel_values_list.append(pixel_values)
-            num_patches_lists.append(num_patches_list)
+            img = Image.open(frame_path).convert('RGB')
+            pil_images.append(img)
         
-        # Ground truth order is [0, 1, 2, 3, 4] (already sorted)
+        # Ground truth order
         gt_order = torch.arange(self.num_frames, dtype=torch.long)
         
         return {
-            'pixel_values_list': pixel_values_list,
-            'num_patches_lists': num_patches_lists,
+            'images': pil_images,
             'ground_truth_order': gt_order,
             'video_id': video_id
         }

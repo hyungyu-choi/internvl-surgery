@@ -36,6 +36,7 @@ ENV/
 # Data and outputs
 experiments/
 checkpoints/
+checkpoints_lora/
 outputs/
 *.pkl
 *.pth
