@@ -1,30 +1,27 @@
 """
 InternVL3 Model Wrapper for surgical phase recognition
+Extracts last token from final LLM layer
 """
 import torch
 import numpy as np
 from transformers import AutoTokenizer, AutoModel
 
-from configs import VISUAL_TOKEN_START_IDX, N_VISUAL_TOKENS, TARGET_LAYER_IDX
-
 
 class InternVL3Wrapper:
     """
-    Wrapper for InternVL3 model with embedding extraction
+    Wrapper for InternVL3 model with last token extraction
     """
     
-    def __init__(self, model_path, device='cuda', layer_idx=TARGET_LAYER_IDX):
+    def __init__(self, model_path, device='cuda'):
         """
         Initialize InternVL3 model
         
         Args:
             model_path: Path to pretrained model
             device: Device to load model on
-            layer_idx: Layer index to extract embeddings from
         """
         self.model_path = model_path
         self.device = device
-        self.layer_idx = layer_idx
         
         print(f"Loading InternVL3 from {model_path}...")
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -36,43 +33,48 @@ class InternVL3Wrapper:
             trust_remote_code=True
         ).eval().to(device)
         
+        # Get last layer index
+        self.last_layer_idx = len(self.model.language_model.model.layers) - 1
+        
         print(f"Model loaded successfully on {device}")
+        print(f"Using last layer (index {self.last_layer_idx}) for token extraction")
     
-    def extract_visual_embeddings(self, pixel_values, num_patches_list):
+    def extract_last_token(self, pixel_values, num_patches_list, return_tensor=False):
         """
-        Extract visual embeddings from specified LLM layer
+        Extract last token from the final LLM layer
         
         Args:
             pixel_values: Preprocessed image tensor
             num_patches_list: List containing number of patches
+            return_tensor: If True, return torch tensor on device; if False, return numpy array
         
         Returns:
-            Frame embedding as numpy array [hidden_dim]
+            Last token embedding as numpy array [hidden_dim] or torch tensor [hidden_dim]
         """
+        # Remove batch dimension if present: [1, num_patches, 3, H, W] -> [num_patches, 3, H, W]
+        if pixel_values.dim() == 5:
+            pixel_values = pixel_values.squeeze(0)
+        
         pixel_values = pixel_values.to(self.device)
-        visual_embeddings = []
+        last_tokens = []
         
         def hook_fn(module, input, output):
-            """Hook to capture visual token embeddings"""
+            """Hook to capture last token from final layer"""
             hidden_states = output[0] if isinstance(output, tuple) else output
-            
-            # Extract visual tokens (start_idx to start_idx + n_tokens)
-            visual_end_idx = VISUAL_TOKEN_START_IDX + N_VISUAL_TOKENS
-            visual_hidden = hidden_states[:, VISUAL_TOKEN_START_IDX:visual_end_idx, :]
-            
-            visual_embeddings.append(visual_hidden.detach().cpu())
+            # Extract last token: [batch, seq_len, hidden_dim] -> [batch, hidden_dim]
+            last_token = hidden_states[:, -1, :]
+            last_tokens.append(last_token.detach().cpu())
         
-        # Register hook on target layer
-        hook_handle = self.model.language_model.model.layers[self.layer_idx].register_forward_hook(hook_fn)
+        # Register hook on last layer
+        hook_handle = self.model.language_model.model.layers[self.last_layer_idx].register_forward_hook(hook_fn)
         
         try:
             with torch.no_grad():
-                # Forward pass with minimal text to trigger visual encoding
-                dummy_question = "Describe this image."
+                # Forward pass with minimal text to trigger encoding
                 _ = self.model.chat(
                     self.tokenizer,
                     pixel_values,
-                    dummy_question,
+                    "Describe this image.",
                     generation_config=dict(max_new_tokens=1, do_sample=False),
                     num_patches_list=num_patches_list,
                     history=None,
@@ -81,28 +83,34 @@ class InternVL3Wrapper:
         finally:
             hook_handle.remove()
         
-        if visual_embeddings:
-            # Average pool visual tokens to get frame representation
-            visual_emb = visual_embeddings[0]  # [batch, n_visual_tokens, hidden_dim]
-            frame_embedding = visual_emb.mean(dim=1).squeeze(0)  # [hidden_dim]
-            return frame_embedding.float().numpy()
+        if last_tokens:
+            # Get last token
+            last_token = last_tokens[0].squeeze(0)  # [hidden_dim]
+            
+            if return_tensor:
+                # Return as float tensor on device
+                return last_token.float().to(self.device)
+            else:
+                # Return as numpy array
+                return last_token.float().numpy()
         
         return None
     
-    def extract_embeddings_batch(self, pixel_values_list, num_patches_lists):
+    def extract_last_tokens_batch(self, pixel_values_list, num_patches_lists, return_tensor=False):
         """
-        Extract embeddings for a batch of images
+        Extract last tokens for a batch of images
         
         Args:
             pixel_values_list: List of preprocessed image tensors
             num_patches_lists: List of num_patches_list for each image
+            return_tensor: If True, return torch tensors; if False, return numpy arrays
         
         Returns:
-            List of frame embeddings
+            List of last token embeddings (tensors or numpy arrays)
         """
         embeddings = []
         for pixel_values, num_patches_list in zip(pixel_values_list, num_patches_lists):
-            embedding = self.extract_visual_embeddings(pixel_values, num_patches_list)
+            embedding = self.extract_last_token(pixel_values, num_patches_list, return_tensor=return_tensor)
             embeddings.append(embedding)
         return embeddings
     
@@ -133,4 +141,4 @@ class InternVL3Wrapper:
         return response
     
     def __repr__(self):
-        return f"InternVL3Wrapper(model_path={self.model_path}, layer_idx={self.layer_idx}, device={self.device})"
+        return f"InternVL3Wrapper(model_path={self.model_path}, device={self.device})"

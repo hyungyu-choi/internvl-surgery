@@ -6,9 +6,6 @@ import os
 
 
 # InternVL3 Model Constants
-VISUAL_TOKEN_START_IDX = 42
-N_VISUAL_TOKENS = 256
-TARGET_LAYER_IDX = 13
 INPUT_SIZE = 448
 MAX_NUM_PATCHES = 12
 
@@ -41,8 +38,6 @@ def get_inference_args():
     # Model
     parser.add_argument('--model_path', type=str, default='OpenGVLab/InternVL3-8B',
                         help='Path to InternVL3 model')
-    parser.add_argument('--layer_idx', type=int, default=TARGET_LAYER_IDX,
-                        help='Layer index to extract embeddings from')
     
     # Hardware
     parser.add_argument('--gpu', type=int, default=0,

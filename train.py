@@ -17,44 +17,35 @@ class TemporalRankingModel(nn.Module):
         self.internvl = internvl_wrapper
         self.ranking_head = RankingHead(hidden_dim=hidden_dim)
     
-    def extract_last_token(self, pixel_values, num_patches_list):
-        last_tokens = []
-        
-        def hook_fn(module, input, output):
-            hidden_states = output[0] if isinstance(output, tuple) else output
-            last_token = hidden_states[:, -1, :]
-            last_tokens.append(last_token)
-        
-        last_layer_idx = len(self.internvl.model.language_model.model.layers) - 1
-        hook = self.internvl.model.language_model.model.layers[last_layer_idx].register_forward_hook(hook_fn)
-        
-        try:
-                # Remove batch dimension: [1, num_patches, 3, H, W] -> [num_patches, 3, H, W]
-                pixel_values = pixel_values.squeeze(0).to(self.internvl.device)
-                
-                _ = self.internvl.model.chat(
-                    self.internvl.tokenizer,
-                    pixel_values,
-                    "Describe this image.",
-                    generation_config=dict(max_new_tokens=1, do_sample=False),
-                    num_patches_list=num_patches_list,
-                    history=None,
-                    return_history=False
-                )
-        finally:
-            hook.remove()
-        
-        return last_tokens[0] if last_tokens else None
-    
     def forward(self, pixel_values_list, num_patches_lists):
-        embeddings = []
-        for pixel_values, num_patches_list in zip(pixel_values_list, num_patches_lists):
-            last_token = self.extract_last_token(pixel_values, num_patches_list)
-            embeddings.append(last_token.squeeze(0).float())  # bfloat16 -> float32
+        """
+        Extract last tokens and compute ranking scores
         
-        embeddings = torch.stack(embeddings, dim=0).unsqueeze(0)
-        scores = self.ranking_head(embeddings)
-        return scores.squeeze(0)
+        Args:
+            pixel_values_list: List of [1, num_patches, 3, H, W] tensors
+            num_patches_lists: List of num_patches for each image
+        
+        Returns:
+            scores: [K] ranking scores for K frames
+        """
+        embeddings = []
+        
+        for pixel_values, num_patches_list in zip(pixel_values_list, num_patches_lists):
+            # Use wrapper's extract_last_token method with return_tensor=True
+            last_token_tensor = self.internvl.extract_last_token(
+                pixel_values, 
+                num_patches_list, 
+                return_tensor=True
+            )
+            embeddings.append(last_token_tensor)
+        
+        # Stack: [K, hidden_dim]
+        embeddings = torch.stack(embeddings, dim=0).unsqueeze(0)  # [1, K, hidden_dim]
+        
+        # Get ranking scores
+        scores = self.ranking_head(embeddings)  # [1, K]
+        
+        return scores.squeeze(0)  # [K]
 
 
 def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
@@ -63,10 +54,6 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
     total_loss = 0
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
     
-    # 첫 번째 파라미터 추적
-    first_param = next(model.ranking_head.parameters())
-    param_before = first_param.clone().detach()
-    
     for i, batch in enumerate(pbar):
         pixel_values_list = batch['pixel_values_list']
         num_patches_lists = batch['num_patches_lists']
@@ -74,32 +61,16 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
         
         optimizer.zero_grad()
         
+        # Forward pass
         scores = model(pixel_values_list, num_patches_lists)
-        scores = scores.unsqueeze(0)
+        scores = scores.unsqueeze(0)  # [1, K]
         
+        # Compute loss
         loss = criterion(scores, gt_order)
         
+        # Backward pass
         loss.backward()
-        
-        # # Gradient 확인
-        # if i < 2000:
-        #     print(f"\nScores: {scores}")
-        #     print(f"GT Order: {gt_order}")
-        #     print(f"Loss: {loss.item()}")
-        #     has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 
-        #                   for p in model.ranking_head.parameters())
-        #     print(f"Has gradient: {has_grad}")
-        #     if has_grad:
-        #         grad_norm = sum(p.grad.norm().item() for p in model.ranking_head.parameters() if p.grad is not None)
-        #         print(f"Gradient norm: {grad_norm}")
-        
-        # optimizer.step()
-        
-        # # 파라미터 변화 확인
-        # if i < 2000:
-        #     param_after = first_param.clone().detach()
-        #     param_diff = (param_after - param_before).abs().sum()
-        #     print(f"Parameter change: {param_diff.item()}\n")
+        optimizer.step()
         
         total_loss += loss.item()
         pbar.set_postfix({'loss': loss.item()})
@@ -122,6 +93,7 @@ def main():
     
     config = get_dataset_config(args.dataset)
     
+    # Create dataset
     train_dataset = CholecRankingDataset(
         base_frames_dir=config['base_frames_dir'].replace('test_set', 'training_set'),
         num_frames=3,
@@ -135,12 +107,15 @@ def main():
         num_workers=0
     )
     
+    # Initialize model
     internvl_wrapper = InternVL3Wrapper(args.model_path, device=device)
     model = TemporalRankingModel(internvl_wrapper).to(device)
     
+    # Freeze InternVL3
     for param in model.internvl.model.parameters():
         param.requires_grad = False
     
+    # Optimizer for ranking head only
     optimizer = torch.optim.AdamW(
         model.ranking_head.parameters(),
         lr=args.lr,
@@ -149,10 +124,12 @@ def main():
     
     criterion = PlackettLuceLoss()
     
+    # Training loop
     for epoch in range(1, args.epochs + 1):
         train_loss = train_epoch(model, train_loader, optimizer, criterion, device, epoch)
         print(f"Epoch {epoch}: Loss = {train_loss:.4f}")
         
+        # Save checkpoint
         if epoch % args.save_freq == 0:
             os.makedirs(args.output_dir, exist_ok=True)
             torch.save({
