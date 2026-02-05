@@ -1,144 +1,133 @@
 """
-InternVL3 Model Wrapper for surgical phase recognition
-Extracts last token from final LLM layer
+InternVL3 Model Wrapper using HuggingFace official implementation
 """
 import torch
-import numpy as np
-from transformers import AutoTokenizer, AutoModel
+import torch.nn as nn
+from transformers import AutoModel, AutoProcessor
 
 
-class InternVL3Wrapper:
+class InternVL3Wrapper(nn.Module):
     """
-    Wrapper for InternVL3 model with last token extraction
+    Wrapper for InternVL3 using HuggingFace official API
     """
     
     def __init__(self, model_path, device='cuda'):
-        """
-        Initialize InternVL3 model
-        
-        Args:
-            model_path: Path to pretrained model
-            device: Device to load model on
-        """
+        super().__init__()
         self.model_path = model_path
         self.device = device
         
         print(f"Loading InternVL3 from {model_path}...")
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        self.processor = AutoProcessor.from_pretrained(
             model_path, trust_remote_code=True
         )
         self.model = AutoModel.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True
-        ).eval().to(device)
+        ).to(device)
         
-        # Get last layer index
-        self.last_layer_idx = len(self.model.language_model.model.layers) - 1
-        
-        print(f"Model loaded successfully on {device}")
-        print(f"Using last layer (index {self.last_layer_idx}) for token extraction")
+        self.hidden_dim = self.model.language_model.config.hidden_size
+        print(f"Model loaded. Hidden dim: {self.hidden_dim}")
     
-    def extract_last_token(self, pixel_values, num_patches_list, return_tensor=False):
+    def freeze_vision_encoder(self):
+        """Freeze vision encoder parameters"""
+        for param in self.model.vision_model.parameters():
+            param.requires_grad = False
+        print("✓ Vision encoder frozen")
+    
+    def forward(self, pixel_values, input_ids, attention_mask):
         """
-        Extract last token from the final LLM layer
+        Forward pass through InternVL model
+        
+        Args:
+            pixel_values: [B, C, H, W] image tensor
+            input_ids: [B, seq_len] token ids
+            attention_mask: [B, seq_len] attention mask
+        
+        Returns:
+            last_hidden_state: [B, seq_len, hidden_dim]
+        """
+        outputs = self.model(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True
+        )
+        return outputs.last_hidden_state
+    
+    def process_image_for_forward(self, pixel_values, num_patches_list):
+        """
+        Process image using InternVL processor
         
         Args:
             pixel_values: Preprocessed image tensor
-            num_patches_list: List containing number of patches
-            return_tensor: If True, return torch tensor on device; if False, return numpy array
+            num_patches_list: List of num patches
         
         Returns:
-            Last token embedding as numpy array [hidden_dim] or torch tensor [hidden_dim]
+            Processed inputs dict
         """
-        # Remove batch dimension if present: [1, num_patches, 3, H, W] -> [num_patches, 3, H, W]
+        # Convert tensor to PIL Image for processor
+        from PIL import Image
+        import torchvision.transforms as T
+        
         if pixel_values.dim() == 5:
             pixel_values = pixel_values.squeeze(0)
         
-        pixel_values = pixel_values.to(self.device)
-        last_tokens = []
+        # Convert from tensor to PIL
+        to_pil = T.ToPILImage()
+        images = [to_pil(pixel_values[i]) for i in range(pixel_values.size(0))]
         
-        def hook_fn(module, input, output):
-            """Hook to capture last token from final layer"""
-            hidden_states = output[0] if isinstance(output, tuple) else output
-            # Extract last token: [batch, seq_len, hidden_dim] -> [batch, hidden_dim]
-            last_token = hidden_states[:, -1, :]
-            last_tokens.append(last_token.detach().cpu())
+        # Use processor
+        text = "Image"
+        inputs = self.processor(
+            images=images[0] if len(images) == 1 else images,
+            text=text,
+            return_tensors='pt',
+            padding=True
+        )
         
-        # Register hook on last layer
-        hook_handle = self.model.language_model.model.layers[self.last_layer_idx].register_forward_hook(hook_fn)
-        
-        try:
-            with torch.no_grad():
-                # Forward pass with minimal text to trigger encoding
-                _ = self.model.chat(
-                    self.tokenizer,
-                    pixel_values,
-                    "Describe this image.",
-                    generation_config=dict(max_new_tokens=1, do_sample=False),
-                    num_patches_list=num_patches_list,
-                    history=None,
-                    return_history=False
-                )
-        finally:
-            hook_handle.remove()
-        
-        if last_tokens:
-            # Get last token
-            last_token = last_tokens[0].squeeze(0)  # [hidden_dim]
-            
-            if return_tensor:
-                # Return as float tensor on device
-                return last_token.float().to(self.device)
-            else:
-                # Return as numpy array
-                return last_token.float().numpy()
-        
-        return None
+        return {k: v.to(self.device) for k, v in inputs.items()}
     
-    def extract_last_tokens_batch(self, pixel_values_list, num_patches_lists, return_tensor=False):
+    def extract_last_token_embedding(self, pixel_values, num_patches_list):
         """
-        Extract last tokens for a batch of images
-        
-        Args:
-            pixel_values_list: List of preprocessed image tensors
-            num_patches_lists: List of num_patches_list for each image
-            return_tensor: If True, return torch tensors; if False, return numpy arrays
-        
-        Returns:
-            List of last token embeddings (tensors or numpy arrays)
-        """
-        embeddings = []
-        for pixel_values, num_patches_list in zip(pixel_values_list, num_patches_lists):
-            embedding = self.extract_last_token(pixel_values, num_patches_list, return_tensor=return_tensor)
-            embeddings.append(embedding)
-        return embeddings
-    
-    def chat(self, pixel_values, question, num_patches_list, **kwargs):
-        """
-        Direct chat interface (for custom prompting)
+        Extract last token embedding from LLM
         
         Args:
             pixel_values: Preprocessed image tensor
-            question: Text prompt
-            num_patches_list: List containing number of patches
-            **kwargs: Additional arguments for generation
+            num_patches_list: List of num patches
         
         Returns:
-            Model response
+            Last token embedding [hidden_dim]
         """
-        pixel_values = pixel_values.to(self.device)
+        inputs = self.process_image_for_forward(pixel_values, num_patches_list)
         
         with torch.no_grad():
-            response = self.model.chat(
-                self.tokenizer,
-                pixel_values,
-                question,
-                num_patches_list=num_patches_list,
-                **kwargs
+            outputs = self.model(
+                **inputs,
+                output_hidden_states=True,
+                return_dict=True
             )
+            # Extract last token: [1, seq_len, hidden_dim] -> [hidden_dim]
+            last_token = outputs.last_hidden_state[0, -1, :]
         
-        return response
+        return last_token.cpu().numpy()
     
-    def __repr__(self):
-        return f"InternVL3Wrapper(model_path={self.model_path}, device={self.device})"
+    def get_trainable_parameters(self):
+        """Return trainable parameters info"""
+        trainable_params = []
+        total_params = 0
+        trainable_count = 0
+        
+        for name, param in self.model.named_parameters():
+            total_params += param.numel()
+            if param.requires_grad:
+                trainable_count += param.numel()
+                trainable_params.append(name)
+        
+        return {
+            'trainable_params': trainable_params,
+            'trainable_count': trainable_count,
+            'total_params': total_params,
+            'trainable_ratio': trainable_count / total_params if total_params > 0 else 0
+        }
